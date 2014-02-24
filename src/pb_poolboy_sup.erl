@@ -1,6 +1,6 @@
 %% Poolboy - A hunky Erlang worker pool factory
 
--module(poolboy_sup).
+-module(pb_poolboy_sup).
 -behaviour(supervisor).
 
 -export([start_link/2, init/1]).

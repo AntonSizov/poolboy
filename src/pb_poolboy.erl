@@ -1,6 +1,6 @@
 %% Poolboy - A hunky Erlang worker pool factory
 
--module(poolboy).
+-module(pb_poolboy).
 -behaviour(gen_server).
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
@@ -49,14 +49,14 @@ checkin(Pool, Worker) when is_pid(Worker) ->
 transaction(Pool, Fun) ->
     transaction(Pool, Fun, ?TIMEOUT).
 
--spec transaction(Pool :: node(), Fun :: fun((Worker :: pid()) -> any()), 
+-spec transaction(Pool :: node(), Fun :: fun((Worker :: pid()) -> any()),
     Timeout :: timeout()) -> any().
 transaction(Pool, Fun, Timeout) ->
-    Worker = poolboy:checkout(Pool, true, Timeout),
+    Worker = pb_poolboy:checkout(Pool, true, Timeout),
     try
         Fun(Worker)
     after
-        ok = poolboy:checkin(Pool, Worker)
+        ok = pb_poolboy:checkin(Pool, Worker)
     end.
 
 -spec child_spec(Pool :: node(), PoolArgs :: proplists:proplist())
@@ -69,8 +69,8 @@ child_spec(Pool, PoolArgs) ->
                  WorkerArgs :: proplists:proplist())
     -> supervisor:child_spec().
 child_spec(Pool, PoolArgs, WorkerArgs) ->
-    {Pool, {poolboy, start_link, [PoolArgs, WorkerArgs]},
-     permanent, 5000, worker, [poolboy]}.
+    {Pool, {pb_poolboy, start_link, [PoolArgs, WorkerArgs]},
+     permanent, 5000, worker, [pb_poolboy]}.
 
 -spec start(PoolArgs :: proplists:proplist())
     -> gen:start_ret().
@@ -110,7 +110,7 @@ init({PoolArgs, WorkerArgs}) ->
     init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors}).
 
 init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
-    {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
+    {ok, Sup} = pb_poolboy_sup:start_link(Mod, WorkerArgs),
     init(Rest, WorkerArgs, State#state{supervisor = Sup});
 init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
     init(Rest, WorkerArgs, State#state{size = Size});
