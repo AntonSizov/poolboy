@@ -219,8 +219,8 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
-    ok.
+terminate(Reason, State) ->
+    true = exit(State#state.supervisor, Reason).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
