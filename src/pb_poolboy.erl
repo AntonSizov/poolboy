@@ -181,7 +181,6 @@ handle_call(get_all_monitors, _From, State) ->
     Monitors = ets:tab2list(State#state.monitors),
     {reply, Monitors, State};
 handle_call(stop, _From, State) ->
-    true = exit(State#state.supervisor, shutdown),
     {stop, normal, ok, State};
 handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
@@ -219,8 +218,12 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(Reason, State) ->
-    true = exit(State#state.supervisor, Reason).
+terminate(_Reason, State = #state{workers = WorkersQ, monitors = Monitors}) ->
+	%% unlink workers in queue
+	[unlink(Pid) || Pid <- queue:to_list(WorkersQ)],
+	%% unlink workers in monitors
+	[unlink(Pid) || {Pid, _Ref} <- ets:tab2list(Monitors)],
+    true = exit(State#state.supervisor, shutdown).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
