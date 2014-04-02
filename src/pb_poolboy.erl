@@ -152,7 +152,8 @@ handle_call({checkout, Block}, {FromPid, _} = From, State) ->
             true = ets:insert(Monitors, {Pid, Ref}),
             {reply, Pid, State#state{workers = Left}};
         {empty, Empty} when MaxOverflow > 0, Overflow < MaxOverflow ->
-            {Pid, Ref} = new_worker(Sup, FromPid),
+            Pid = new_worker(Sup),
+		    Ref = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
             {reply, Pid, State#state{workers = Empty, overflow = Overflow + 1}};
         {empty, Empty} when Block =:= false ->
@@ -240,11 +241,6 @@ new_worker(Sup) ->
     {ok, Pid} = supervisor:start_child(Sup, []),
     true = link(Pid),
     Pid.
-
-new_worker(Sup, FromPid) ->
-    Pid = new_worker(Sup),
-    Ref = erlang:monitor(process, FromPid),
-    {Pid, Ref}.
 
 dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
