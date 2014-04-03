@@ -21,7 +21,8 @@
 	size = 0 :: non_neg_integer(), %% current static pool size
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-	scheduled = true :: boolean() %% is new worker create scheduled or not
+	scheduled = true :: boolean(), %% is new worker create scheduled or not
+	dismiss = false :: boolean()
 }).
 
 -spec checkout(Pool :: node()) -> pid().
@@ -119,6 +120,8 @@ init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
     init(Rest, WorkerArgs, State#state{max_size = Size});
 init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
     init(Rest, WorkerArgs, State#state{max_overflow = MaxOverflow});
+init([{dismiss_overflow, Dismiss} | Rest], WorkerArgs, State) when is_boolean(Dismiss) ->
+	init(Rest, WorkerArgs, State#state{dismiss = Dismiss});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{max_size = MaxSize, supervisor = Sup} = State) ->
@@ -353,21 +356,22 @@ prepopulate(N, Sup, Workers) ->
 
 handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
-           waiting = Waiting,
+		   waiting = Waiting,
            monitors = Monitors,
-           overflow = Overflow} = State,
+           overflow = Overflow,
+		   dismiss = Dismiss} = State,
     case queue:out(Waiting) of
         {{value, {{FromPid, _} = From, _}}, Left} ->
             Ref = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
-        {empty, Empty} when Overflow > 0 ->
+        {empty, Empty} when Overflow > 0, Dismiss == true ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};
         {empty, Empty} ->
             Workers = queue:in(Pid, State#state.workers),
-            State#state{workers = Workers, waiting = Empty, overflow = 0}
+            State#state{workers = Workers, waiting = Empty}
     end.
 
 handle_worker_exit(Pid, State) ->
@@ -405,7 +409,7 @@ handle_worker_exit(Pid, State) ->
 		            State#state{workers = Workers, waiting = Empty};
 				{error, _Reason} ->
 					schedule_worker_create(State),
-		            State#state{workers = FilteredWorkers, waiting = Empty, scheduled = true}
+		            State#state{size = Size - 1, workers = FilteredWorkers, waiting = Empty, scheduled = true}
 			end
     end.
 
