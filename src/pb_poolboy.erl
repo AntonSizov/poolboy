@@ -211,19 +211,27 @@ handle_call({checkout, Block}, {FromPid, _} = From, State) ->
 
 handle_call(status, _From, State) ->
     #state{workers = Workers,
+		   dismiss = Dismiss,
+		   scheduled = Scheduled,
            monitors = Monitors,
            overflow = Overflow,
+		   max_overflow = MaxOverflow,
 		   supervisor = Sup,
-		   size = Size} = State,
+		   size = Size,
+		   max_size = MaxSize} = State,
     StateName = state_name(State),
 	SupChilds = proplists:get_value(active, supervisor:count_children(Sup)),
 	Status = [
 		{state, StateName},
 		{workers, queue:len(Workers)},
 		{size, Size},
+		{max_size, MaxSize},
 		{overflow, Overflow},
+		{max_overflow, MaxOverflow},
 		{monitors, ets:info(Monitors, size)},
-		{sup_childs, SupChilds}
+		{sup_childs, SupChilds},
+		{dismiss, Dismiss},
+		{is_worker_create_scheduled, Scheduled}
 	],
     {reply, {ok, Status}, State};
 handle_call(get_avail_workers, _From, State) ->
@@ -284,7 +292,8 @@ handle_info({'DOWN', Ref, _, _, _}, State) ->
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{monitors = Monitors,
-		   size = Size} = State,
+		   size = Size,
+		   overflow = Overflow} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
@@ -293,7 +302,10 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             {noreply, NewState};
         [] ->
             case queue:member(Pid, State#state.workers) of
-                true ->
+                true when Overflow > 0 ->
+                    W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
+                    {noreply, State#state{workers = W, overflow = Overflow - 1}};
+				true ->
                     W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
                     {noreply, State#state{workers = W, size = Size - 1}};
                 false ->
