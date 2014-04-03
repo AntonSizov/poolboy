@@ -10,6 +10,7 @@
          code_change/3]).
 
 -define(TIMEOUT, 5000).
+-record(create_worker, {}).
 
 -record(state, {
     supervisor :: pid(),
@@ -19,7 +20,8 @@
     max_size = 5 :: non_neg_integer(), %% max static pool size
 	size = 0 :: non_neg_integer(), %% current static pool size
     overflow = 0 :: non_neg_integer(),
-    max_overflow = 10 :: non_neg_integer()
+    max_overflow = 10 :: non_neg_integer(),
+	scheduled = true :: boolean() %% is new worker create scheduled or not
 }).
 
 -spec checkout(Pool :: node()) -> pid().
@@ -119,9 +121,19 @@ init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(Ma
     init(Rest, WorkerArgs, State#state{max_overflow = MaxOverflow});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
-init([], _WorkerArgs, #state{max_size = Size, supervisor = Sup} = State) ->
-    Workers = prepopulate(Size, Sup),
-    {ok, State#state{size = queue:len(Workers), workers = Workers}}.
+init([], _WorkerArgs, #state{max_size = MaxSize, supervisor = Sup} = State) ->
+    Workers = prepopulate(MaxSize, Sup),
+	Size = queue:len(Workers),
+	Scheduled =
+	case Size < MaxSize of
+		true -> schedule_worker_create(State), true;
+		false -> false
+	end,
+    {ok, State#state{
+			size = Size,
+			workers = Workers,
+			scheduled = Scheduled
+	}}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     case ets:lookup(Monitors, Pid) of
@@ -148,38 +160,43 @@ handle_call({checkout, Block}, {FromPid, _} = From, State) ->
            overflow = Overflow,
            max_overflow = MaxOverflow,
 		   size = Size,
-		   max_size = MaxSize} = State,
+		   max_size = MaxSize,
+		   scheduled = Scheduled} = State,
     case queue:out(Workers) of
         {{value, Pid}, Left} ->
             Ref = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
             {reply, Pid, State#state{workers = Left}};
 		%% pool for some reason is not full
-        {empty, Empty} when MaxSize > 0, Size < MaxSize ->
+        {empty, Empty} when MaxSize > 0, Size < MaxSize, Scheduled == false ->
 			case new_worker(Sup) of
 				{ok, Pid} ->
 				    Ref = erlang:monitor(process, FromPid),
 		            true = ets:insert(Monitors, {Pid, Ref}),
 		            {reply, Pid, State#state{workers = Empty, size = Size + 1}};
 				{error, _Reason} when Block =:= false ->
-		            {reply, full, State#state{workers = Empty}};
+					schedule_worker_create(State),
+		            {reply, full, State#state{workers = Empty, scheduled = true}};
 				{error, _Reason} ->
 				    Ref = erlang:monitor(process, FromPid),
 		            Waiting = queue:in({From, Ref}, State#state.waiting),
-		            {noreply, State#state{workers = Empty, waiting = Waiting}}
+					schedule_worker_create(State),
+		            {noreply, State#state{workers = Empty, waiting = Waiting, scheduled = true}}
 			end;
-        {empty, Empty} when MaxOverflow > 0, Overflow < MaxOverflow ->
+        {empty, Empty} when MaxOverflow > 0, Overflow < MaxOverflow, Scheduled == false ->
 			case new_worker(Sup) of
 				{ok, Pid} ->
 				    Ref = erlang:monitor(process, FromPid),
 		            true = ets:insert(Monitors, {Pid, Ref}),
 		            {reply, Pid, State#state{workers = Empty, overflow = Overflow + 1}};
 				{error, _Reason} when Block =:= false ->
-		            {reply, full, State#state{workers = Empty}};
+					schedule_worker_create(State),
+		            {reply, full, State#state{workers = Empty, scheduled = true}};
 				{error, _Reason} ->
 				    Ref = erlang:monitor(process, FromPid),
 		            Waiting = queue:in({From, Ref}, State#state.waiting),
-		            {noreply, State#state{workers = Empty, waiting = Waiting}}
+					schedule_worker_create(State),
+		            {noreply, State#state{workers = Empty, waiting = Waiting, scheduled = true}}
 			end;
         {empty, Empty} when Block =:= false ->
             {reply, full, State#state{workers = Empty}};
@@ -223,6 +240,35 @@ handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
     {reply, Reply, State}.
 
+handle_info(#create_worker{}, State = #state{}) ->
+	#state{supervisor = Sup,
+		   size = Size,
+		   max_size = MaxSize,
+		   overflow = Overflow,
+		   max_overflow = MaxOverflow,
+		   waiting = Waiting,
+		   monitors = Monitors} = State,
+	case queue:out(Waiting) of
+        {{value, {{FromPid, _} = From, _}}, Left} ->
+			case new_worker(Sup) of
+				{ok, NewPid} when Size < MaxSize ->
+		            Ref = erlang:monitor(process, FromPid),
+		            true = ets:insert(Monitors, {NewPid, Ref}),
+		            gen_server:reply(From, NewPid),
+		            {noreply, State#state{waiting = Left, size = Size + 1, scheduled = false}};
+				{ok, NewPid} when Overflow < MaxOverflow ->
+		            Ref = erlang:monitor(process, FromPid),
+		            true = ets:insert(Monitors, {NewPid, Ref}),
+		            gen_server:reply(From, NewPid),
+		            {noreply, State#state{waiting = Left, overflow = Overflow + 1, scheduled = false}};
+				{error, _Reason} ->
+					schedule_worker_create(State#state{scheduled = false}),
+					{noreply, State#state{scheduled = true}}
+			end;
+        {empty, _Empty} ->
+			{noreply, State#state{scheduled = false}}
+	end;
+
 handle_info({'DOWN', Ref, _, _, _}, State) ->
     case ets:match(State#state.monitors, {'$1', Ref}) of
         [[Pid]] ->
@@ -234,8 +280,8 @@ handle_info({'DOWN', Ref, _, _, _}, State) ->
             {noreply, State#state{waiting = Waiting}}
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
-    #state{supervisor = Sup,
-           monitors = Monitors} = State,
+    #state{monitors = Monitors,
+		   size = Size} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
@@ -246,13 +292,7 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case queue:member(Pid, State#state.workers) of
                 true ->
                     W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
-					case new_worker(Sup) of
-						{ok, NewPid} ->
-		                    {noreply, State#state{workers = queue:in(NewPid, W)}};
-						{error, _Reason} ->
-							Size = State#state.size,
-							{noreply, State#state{workers = W, size = Size - 1}}
-					end;
+                    {noreply, State#state{workers = W, size = Size - 1}};
                 false ->
 					%% worker pid should be in monitors' list or in ready queue
 					%% if not, it is abnormous
@@ -289,7 +329,6 @@ new_worker(Sup) ->
 		    true = link(Pid),
 			{ok, Pid};
 		{error, Reason} ->
-			error_logger:warning_msg("Can't start worker: ~p", [Reason]),
 			{error, Reason}
 	end.
 
@@ -335,8 +374,13 @@ handle_worker_exit(Pid, State) ->
     #state{supervisor = Sup,
            monitors = Monitors,
            overflow = Overflow,
-		   size = Size} = State,
+		   size = Size,
+		   scheduled = Scheduled} = State,
     case queue:out(State#state.waiting) of
+        _ when Scheduled == true, Overflow > 0 ->
+            State#state{overflow = Overflow - 1};
+        _ when Scheduled == true ->
+            State#state{size = Size - 1};
         {{value, {{FromPid, _} = From, _}}, LeftWaiting} ->
             case new_worker(State#state.supervisor) of
 				{ok, NewWorker} ->
@@ -345,18 +389,24 @@ handle_worker_exit(Pid, State) ->
 		            gen_server:reply(From, NewWorker),
 		            State#state{waiting = LeftWaiting};
 				{error, _Reason} when Overflow > 0 ->
-					State#state{overflow = Overflow - 1};
+					schedule_worker_create(State),
+					State#state{overflow = Overflow - 1, scheduled = true};
 				{error, _Reason} ->
-					State#state{size = Size - 1}
+					schedule_worker_create(State),
+					State#state{size = Size - 1, scheduled = true}
 			end;
         {empty, Empty} when Overflow > 0 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
         {empty, Empty} ->
-            Workers = queue:in(
-                new_worker(Sup),
-                queue:filter(fun (P) -> P =/= Pid end, State#state.workers)
-            ),
-            State#state{workers = Workers, waiting = Empty}
+			FilteredWorkers = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
+			case new_worker(Sup) of
+				{ok, NewWorker} ->
+		            Workers = queue:in(NewWorker, FilteredWorkers),
+		            State#state{workers = Workers, waiting = Empty};
+				{error, _Reason} ->
+					schedule_worker_create(State),
+		            State#state{workers = FilteredWorkers, waiting = Empty, scheduled = true}
+			end
     end.
 
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
@@ -370,3 +420,7 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
     full;
 state_name(_State) ->
     overflow.
+
+schedule_worker_create(#state{scheduled = true}) -> ok;
+schedule_worker_create(#state{scheduled = false}) ->
+	erlang:send_after(1000, self(), #create_worker{}).
