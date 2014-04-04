@@ -21,7 +21,7 @@
 	size = 0 :: non_neg_integer(), %% current static pool size
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-	scheduled = true :: boolean(), %% is new worker create scheduled or not
+	scheduled = false :: boolean(), %% is new worker create scheduled or not
 	dismiss = false :: boolean()
 }).
 
