@@ -243,32 +243,9 @@ handle_info({'DOWN', Ref, _, _, _}, State) ->
     end;
 handle_info({'EXIT', Pid, Reason}, State = #state{supervisor = Pid}) ->
 	{stop, Reason, State};
-handle_info({'EXIT', Pid, _Reason}, State) ->
-    #state{monitors = Monitors,
-		   size = Size,
-		   overflow = Overflow} = State,
-    case ets:lookup(Monitors, Pid) of
-        [{Pid, Ref}] ->
-            true = erlang:demonitor(Ref),
-            true = ets:delete(Monitors, Pid),
-            NewState = handle_worker_exit(Pid, State),
-            {noreply, NewState};
-        [] ->
-            case queue:member(Pid, State#state.workers) of
-                true when Overflow > 0 ->
-                    W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
-                    {noreply, State#state{workers = W, overflow = Overflow - 1}};
-				true ->
-                    W = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
-                    {noreply, State#state{workers = W, size = Size - 1}};
-                false ->
-					%% worker pid should be in monitors' list or in ready queue
-					%% if not, it is abnormous
-					error_logger:warning_msg("Got exit signal from worker not in"
-						" monitors' list nor in ready queue either"),
-                    {noreply, State}
-            end
-    end;
+handle_info({'EXIT', Pid, _Reason}, State0) ->
+	State1 = handle_worker_exit(cleanup_monitors, Pid, State0),
+	{noreply, State1};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -331,46 +308,6 @@ handle_checkin(Pid, State) ->
             State#state{workers = Workers, waiting = Empty}
     end.
 
-handle_worker_exit(Pid, State) ->
-    #state{monitors = Monitors,
-           overflow = Overflow,
-		   size = Size,
-		   scheduled = Scheduled} = State,
-    case queue:out(State#state.waiting) of
-        _ when Scheduled == true, Overflow > 0 ->
-            State#state{overflow = Overflow - 1};
-        _ when Scheduled == true ->
-            State#state{size = Size - 1};
-        {{value, {{FromPid, _} = From, _}}, LeftWaiting} ->
-			NewWorkerType = new_worker_type(State),
-            case new_worker(NewWorkerType, State) of
-				{ok, NewWorker} ->
-		            MonitorRef = erlang:monitor(process, FromPid),
-		            true = ets:insert(Monitors, {NewWorker, MonitorRef}),
-		            gen_server:reply(From, NewWorker),
-		            State#state{waiting = LeftWaiting};
-				{error, _Reason} when Overflow > 0 ->
-					schedule_worker_create(State),
-					State#state{overflow = Overflow - 1, scheduled = true};
-				{error, _Reason} ->
-					schedule_worker_create(State),
-					State#state{size = Size - 1, scheduled = true}
-			end;
-        {empty, Empty} when Overflow > 0 ->
-            State#state{overflow = Overflow - 1, waiting = Empty};
-        {empty, Empty} ->
-			NewWorkerType = new_worker_type(State),
-			FilteredWorkers = queue:filter(fun (P) -> P =/= Pid end, State#state.workers),
-			case new_worker(NewWorkerType, State) of
-				{ok, NewWorker} ->
-		            Workers = queue:in(NewWorker, FilteredWorkers),
-		            State#state{workers = Workers, waiting = Empty};
-				{error, _Reason} ->
-					schedule_worker_create(State),
-		            State#state{size = Size - 1, workers = FilteredWorkers, waiting = Empty, scheduled = true}
-			end
-    end.
-
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
     #state{max_overflow = MaxOverflow, workers = Workers} = State,
     case queue:len(Workers) == 0 of
@@ -408,7 +345,7 @@ handle_checkout(try_create_worker, Block, From, State0) ->
 	Type = new_worker_type(State0),
 	case new_worker(Type, State0) of
 		{ok, Pid} ->
-			State1 = increase_worker_counter(State0),
+			State1 = increment_worker_counter(State0),
 			delegate_worker(Pid, From, State1),
 			State1;
 		{error, _Reason} when Block =:= false ->
@@ -457,7 +394,7 @@ handle_unlock_create_workers(try_create_worker, State0) ->
 	Type = new_worker_type(State0),
 	case new_worker(Type, State0) of
 		{ok, Pid} ->
-			State1 = increase_worker_counter(State0),
+			State1 = increment_worker_counter(State0),
 			{ok, From, State2} = get_waiting(State1),
 			delegate_worker(Pid, From, State2),
 			State2;
@@ -471,6 +408,58 @@ get_waiting(State = #state{waiting = Waiting}) ->
 		{{value, {From, _}}, Left} ->
 			{ok, From, State#state{waiting = Left}};
 		{empty, _Empty} -> empty
+	end.
+
+%% ===================================================================
+%% Handle worker exit
+%% ===================================================================
+
+handle_worker_exit(cleanup_monitors, Pid, State0) ->
+	Monitors = State0#state.monitors,
+	case ets:lookup(Monitors, Pid) of
+		[{Pid, Ref}] ->
+            true = erlang:demonitor(Ref),
+            true = ets:delete(Monitors, Pid),
+			State1 = decrement_worker_counter(State0),
+			handle_worker_exit(is_there_waiting, State1);
+		[] ->
+			handle_worker_exit(cleanup_ready_queue, State0)
+	end;
+handle_worker_exit(cleanup_ready_queue, Pid, State0) ->
+	case queue:member(Pid, State0#state.workers) of
+		true ->
+			State1 = decrement_worker_counter(State0),
+			FilteredWorkers =
+				queue:filter(fun (P) -> P =/= Pid end, State1#state.workers),
+			State2 = State1#state{workers = FilteredWorkers},
+			handle_worker_exit(is_there_waiting, State2);
+		false ->
+			%% skip counter decrement as this case can be
+			%% result of worker dismiss
+			handle_worker_exit(is_there_waiting, State0)
+	end.
+
+handle_worker_exit(is_there_waiting, State0) ->
+	case queue:is_empty(State0#state.waiting) of
+		false -> handle_worker_exit(can_create_worker, State0);
+		true -> State0
+	end;
+handle_worker_exit(can_create_worker, State0) ->
+	case can_create_worker(State0) of
+		true -> handle_worker_exit(try_create_worker, State0);
+		false -> State0
+	end;
+handle_worker_exit(try_create_worker, State0) ->
+	Type = new_worker_type(State0),
+	case new_worker(Type, State0) of
+		{ok, Pid} ->
+			State1 = increment_worker_counter(State0),
+			{ok, From, State2} = get_waiting(State1),
+			delegate_worker(Pid, From, State2),
+			State2;
+		{error, _Reason} ->
+			schedule_worker_create(State0),
+			State0#state{scheduled = true}
 	end.
 
 %% ===================================================================
@@ -511,12 +500,18 @@ new_worker(_, #state{supervisor = Sup}) ->
 			{error, Reason}
 	end.
 
-increase_worker_counter(State = #state{size = S, max_size = MS}) when
+increment_worker_counter(State = #state{size = S, max_size = MS}) when
 		S < MS ->
 	State#state{size = S + 1};
-increase_worker_counter(State = #state{overflow = O, max_overflow = MO}) when
+increment_worker_counter(State = #state{overflow = O, max_overflow = MO}) when
 		O < MO ->
 	State#state{overflow = O + 1}.
+
+decrement_worker_counter(State = #state{overflow = Overflow}) when
+		Overflow > 0 ->
+	State#state{overflow = Overflow - 1};
+decrement_worker_counter(State = #state{size = Size}) ->
+	State#state{size = Size - 1}.
 
 delegate_worker(Pid, {FromPid, _} = From, State) ->
 	Ref = erlang:monitor(process, FromPid),
