@@ -227,34 +227,9 @@ handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
     {reply, Reply, State}.
 
-handle_info(#create_worker{}, State = #state{}) ->
-	#state{size = Size,
-		   max_size = MaxSize,
-		   overflow = Overflow,
-		   max_overflow = MaxOverflow,
-		   waiting = Waiting,
-		   monitors = Monitors} = State,
-	case queue:out(Waiting) of
-        {{value, {{FromPid, _} = From, _}}, Left} ->
-			NewWorkerType = new_worker_type(State),
-			case new_worker(NewWorkerType, State) of
-				{ok, NewPid} when Size < MaxSize ->
-		            Ref = erlang:monitor(process, FromPid),
-		            true = ets:insert(Monitors, {NewPid, Ref}),
-		            gen_server:reply(From, NewPid),
-		            {noreply, State#state{waiting = Left, size = Size + 1, scheduled = false}};
-				{ok, NewPid} when Overflow < MaxOverflow ->
-		            Ref = erlang:monitor(process, FromPid),
-		            true = ets:insert(Monitors, {NewPid, Ref}),
-		            gen_server:reply(From, NewPid),
-		            {noreply, State#state{waiting = Left, overflow = Overflow + 1, scheduled = false}};
-				{error, _Reason} ->
-					schedule_worker_create(State#state{scheduled = false}),
-					{noreply, State#state{scheduled = true}}
-			end;
-        {empty, _Empty} ->
-			{noreply, State#state{scheduled = false}}
-	end;
+handle_info(#create_worker{}, State0 = #state{}) ->
+	State1 = handle_unlock_create_workers(State0),
+	{noreply, State1};
 
 handle_info({'DOWN', Ref, _, _, _}, State) ->
     case ets:match(State#state.monitors, {'$1', Ref}) of
@@ -318,25 +293,6 @@ start_pool(StartFun, PoolArgs, WorkerArgs) ->
             gen_server:StartFun(Name, ?MODULE, {PoolArgs, WorkerArgs}, [])
     end.
 
-%% if auto dismiss overflow workers is disabled, notify workers
-%% that it started as overflow
-new_worker(overflow, #state{supervisor = Sup, dismiss = false}) ->
-    case supervisor:start_child(Sup, [overflow]) of
-		{ok, Pid} ->
-		    true = link(Pid),
-			{ok, Pid};
-		{error, Reason} ->
-			{error, Reason}
-	end;
-new_worker(_, #state{supervisor = Sup}) ->
-    case supervisor:start_child(Sup, []) of
-		{ok, Pid} ->
-		    true = link(Pid),
-			{ok, Pid};
-		{error, Reason} ->
-			{error, Reason}
-	end.
-
 dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
     supervisor:terminate_child(Sup, Pid).
@@ -363,7 +319,7 @@ handle_checkin(Pid, State) ->
 		   dismiss = Dismiss} = State,
     case queue:out(Waiting) of
         {{value, {From, _}}, Left} ->
-			checkout_worker(Pid, From, State),
+			delegate_worker(Pid, From, State),
             State#state{waiting = Left};
         {empty, Empty} when Overflow > 0, Dismiss == true ->
             ok = dismiss_worker(Sup, Pid),
@@ -425,15 +381,6 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
 state_name(_State) ->
     overflow.
 
-schedule_worker_create(#state{scheduled = true}) -> ok;
-schedule_worker_create(#state{scheduled = false}) ->
-	erlang:send_after(1000, self(), #create_worker{}).
-
-new_worker_type(#state{size = Size, max_size = MaxSize})
-		when Size < MaxSize -> static;
-new_worker_type(#state{overflow = Overflow, max_overflow = MaxOverflow})
-		when Overflow < MaxOverflow -> overflow.
-
 %% ===================================================================
 %% Handle checkout
 %% ===================================================================
@@ -441,7 +388,7 @@ new_worker_type(#state{overflow = Overflow, max_overflow = MaxOverflow})
 handle_checkout(Block, From, State0) ->
 	case get_worker(State0) of
 		{ok, Pid, State1} ->
-			checkout_worker(Pid, From, State1),
+			delegate_worker(Pid, From, State1),
 			State1;
 		empty ->
 			handle_checkout(can_create_worker, Block, From, State0)
@@ -460,7 +407,7 @@ handle_checkout(try_create_worker, Block, From, State0) ->
 	case new_worker(Type, State0) of
 		{ok, Pid} ->
 			State1 = increase_worker_counter(State0),
-			checkout_worker(Pid, From, State1),
+			delegate_worker(Pid, From, State1),
 			State1;
 		{error, _Reason} when Block =:= false ->
 			schedule_worker_create(State0),
@@ -474,28 +421,10 @@ handle_checkout(try_create_worker, Block, From, State0) ->
 
 %% Handle checkout helpers
 
-increase_worker_counter(State = #state{size = S, max_size = MS}) when
-		S < MS ->
-	State#state{size = S + 1};
-increase_worker_counter(State = #state{overflow = O, max_overflow = MO}) when
-		O < MO ->
-	State#state{overflow = O + 1}.
-
-checkout_worker(Pid, {FromPid, _} = From, State) ->
-	Ref = erlang:monitor(process, FromPid),
-	true = ets:insert(State#state.monitors, {Pid, Ref}),
-	gen_server:reply(From, Pid).
-
 request_to_waitings({FromPid, _} = From, State) ->
     Ref = erlang:monitor(process, FromPid),
 	Waiting = queue:in({From, Ref}, State#state.waiting),
 	State#state{waiting = Waiting}.
-
-can_create_worker(#state{scheduled = false, size = S, max_size = MS}) when
-		S < MS -> true;
-can_create_worker(#state{scheduled = false, overflow = O, max_overflow = MO}) when
-		O < MO -> true;
-can_create_worker(#state{}) -> false.
 
 get_worker(State = #state{workers = Workers}) ->
     case queue:out(Workers) of
@@ -504,3 +433,90 @@ get_worker(State = #state{workers = Workers}) ->
         {empty, _Empty} ->
 			empty
 	end.
+
+%% ===================================================================
+%% Handle create worker
+%% ===================================================================
+
+handle_unlock_create_workers(State0) ->
+	handle_unlock_create_workers(is_there_waiting, State0#state{scheduled = false}).
+
+handle_unlock_create_workers(is_there_waiting, State0) ->
+	case queue:is_empty(State0#state.waiting) of
+		false -> handle_unlock_create_workers(can_create_worker, State0);
+		true -> State0
+	end;
+handle_unlock_create_workers(can_create_worker, State0) ->
+	case can_create_worker(State0) of
+		true -> handle_unlock_create_workers(try_create_worker, State0);
+		false -> State0
+	end;
+handle_unlock_create_workers(try_create_worker, State0) ->
+	Type = new_worker_type(State0),
+	case new_worker(Type, State0) of
+		{ok, Pid} ->
+			State1 = increase_worker_counter(State0),
+			{ok, From, State2} = get_waiting(State1),
+			delegate_worker(Pid, From, State2),
+			State2;
+		{error, _Reason} ->
+			schedule_worker_create(State0),
+			State0#state{scheduled = true}
+	end.
+
+get_waiting(State = #state{waiting = Waiting}) ->
+	case queue:out(Waiting) of
+		{{value, {From, _}}, Left} ->
+			{ok, From, State#state{waiting = Left}};
+		{empty, _Empty} -> empty
+	end.
+
+%% ===================================================================
+%% Common helpers
+%% ===================================================================
+
+can_create_worker(#state{scheduled = false, size = S, max_size = MS}) when
+		S < MS -> true;
+can_create_worker(#state{scheduled = false, overflow = O, max_overflow = MO}) when
+		O < MO -> true;
+can_create_worker(#state{}) -> false.
+
+schedule_worker_create(#state{scheduled = true}) -> ok;
+schedule_worker_create(#state{scheduled = false}) ->
+	erlang:send_after(1000, self(), #create_worker{}).
+
+new_worker_type(#state{size = Size, max_size = MaxSize})
+		when Size < MaxSize -> static;
+new_worker_type(#state{overflow = Overflow, max_overflow = MaxOverflow})
+		when Overflow < MaxOverflow -> overflow.
+
+%% if auto dismiss overflow workers is disabled, notify workers
+%% that it started as overflow
+new_worker(overflow, #state{supervisor = Sup, dismiss = false}) ->
+    case supervisor:start_child(Sup, [overflow]) of
+		{ok, Pid} ->
+		    true = link(Pid),
+			{ok, Pid};
+		{error, Reason} ->
+			{error, Reason}
+	end;
+new_worker(_, #state{supervisor = Sup}) ->
+    case supervisor:start_child(Sup, []) of
+		{ok, Pid} ->
+		    true = link(Pid),
+			{ok, Pid};
+		{error, Reason} ->
+			{error, Reason}
+	end.
+
+increase_worker_counter(State = #state{size = S, max_size = MS}) when
+		S < MS ->
+	State#state{size = S + 1};
+increase_worker_counter(State = #state{overflow = O, max_overflow = MO}) when
+		O < MO ->
+	State#state{overflow = O + 1}.
+
+delegate_worker(Pid, {FromPid, _} = From, State) ->
+	Ref = erlang:monitor(process, FromPid),
+	true = ets:insert(State#state.monitors, {Pid, Ref}),
+	gen_server:reply(From, Pid).
