@@ -195,19 +195,17 @@ handle_call(status, _From, State) ->
 		   supervisor = Sup,
 		   size = Size,
 		   max_size = MaxSize} = State,
-    StateName = state_name(State),
 	SupChilds = proplists:get_value(active, supervisor:count_children(Sup)),
 	Status = [
-		{state, StateName},
-		{workers, queue:len(Workers)},
+		{dismiss, Dismiss},
+		{scheduled, Scheduled},
 		{size, Size},
 		{max_size, MaxSize},
 		{overflow, Overflow},
 		{max_overflow, MaxOverflow},
+		{workers, queue:len(Workers)},
 		{monitors, ets:info(Monitors, size)},
-		{sup_childs, SupChilds},
-		{dismiss, Dismiss},
-		{is_worker_create_scheduled, Scheduled}
+		{sup_childs, SupChilds}
 	],
     {reply, {ok, Status}, State};
 handle_call(get_avail_workers, _From, State) ->
@@ -307,18 +305,6 @@ handle_checkin(Pid, State) ->
             Workers = queue:in(Pid, State#state.workers),
             State#state{workers = Workers, waiting = Empty}
     end.
-
-state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
-    #state{max_overflow = MaxOverflow, workers = Workers} = State,
-    case queue:len(Workers) == 0 of
-        true when MaxOverflow < 1 -> full;
-        true -> overflow;
-        false -> ready
-    end;
-state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
-    full;
-state_name(_State) ->
-    overflow.
 
 %% ===================================================================
 %% Handle checkout
