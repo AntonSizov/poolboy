@@ -1,13 +1,30 @@
 %% Poolboy - A hunky Erlang worker pool factory
 
 -module(pb_poolboy).
+
 -behaviour(gen_server).
 
--export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
-         transaction/3, child_spec/2, child_spec/3, start/1, start/2,
-         start_link/1, start_link/2, stop/1, status/1]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
-         code_change/3]).
+% API
+-export([
+	checkout/1, checkout/2, checkout/3,
+	checkin/2,
+	transaction/2, transaction/3,
+	child_spec/2, child_spec/3,
+	start/1, start/2,
+	start_link/1, start_link/2,
+	stop/1,
+	status/1
+]).
+
+% gen_server callbacks
+-export([
+	init/1,
+	handle_call/3,
+	handle_cast/2,
+	handle_info/2,
+	terminate/2,
+	code_change/3
+]).
 
 -define(TIMEOUT, 5000).
 -record(create_worker, {}).
@@ -24,6 +41,10 @@
 	scheduled = false :: boolean(), %% is new worker create scheduled or not
 	dismiss = true :: boolean()
 }).
+
+%% ===================================================================
+%% API
+%% ===================================================================
 
 -spec checkout(Pool :: node()) -> pid().
 checkout(Pool) ->
@@ -107,6 +128,10 @@ stop(Pool) ->
 status(Pool) ->
     gen_server:call(Pool, status).
 
+%% ===================================================================
+%% gen_server callbacks
+%% ===================================================================
+
 init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
@@ -156,57 +181,9 @@ handle_cast({cancel_waiting, Pid}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_call({checkout, Block}, {FromPid, _} = From, State) ->
-    #state{workers = Workers,
-           monitors = Monitors,
-           overflow = Overflow,
-           max_overflow = MaxOverflow,
-		   size = Size,
-		   max_size = MaxSize,
-		   scheduled = Scheduled} = State,
-    case queue:out(Workers) of
-        {{value, Pid}, Left} ->
-            Ref = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, Ref}),
-            {reply, Pid, State#state{workers = Left}};
-		%% pool for some reason is not full
-        {empty, Empty} when MaxSize > 0, Size < MaxSize, Scheduled == false ->
-			case new_worker(static, State) of
-				{ok, Pid} ->
-				    Ref = erlang:monitor(process, FromPid),
-		            true = ets:insert(Monitors, {Pid, Ref}),
-		            {reply, Pid, State#state{workers = Empty, size = Size + 1}};
-				{error, _Reason} when Block =:= false ->
-					schedule_worker_create(State),
-		            {reply, full, State#state{workers = Empty, scheduled = true}};
-				{error, _Reason} ->
-				    Ref = erlang:monitor(process, FromPid),
-		            Waiting = queue:in({From, Ref}, State#state.waiting),
-					schedule_worker_create(State),
-		            {noreply, State#state{workers = Empty, waiting = Waiting, scheduled = true}}
-			end;
-        {empty, Empty} when MaxOverflow > 0, Overflow < MaxOverflow, Scheduled == false ->
-			case new_worker(overflow, State) of
-				{ok, Pid} ->
-				    Ref = erlang:monitor(process, FromPid),
-		            true = ets:insert(Monitors, {Pid, Ref}),
-		            {reply, Pid, State#state{workers = Empty, overflow = Overflow + 1}};
-				{error, _Reason} when Block =:= false ->
-					schedule_worker_create(State),
-		            {reply, full, State#state{workers = Empty, scheduled = true}};
-				{error, _Reason} ->
-				    Ref = erlang:monitor(process, FromPid),
-		            Waiting = queue:in({From, Ref}, State#state.waiting),
-					schedule_worker_create(State),
-		            {noreply, State#state{workers = Empty, waiting = Waiting, scheduled = true}}
-			end;
-        {empty, Empty} when Block =:= false ->
-            {reply, full, State#state{workers = Empty}};
-        {empty, Empty} ->
-            Ref = erlang:monitor(process, FromPid),
-            Waiting = queue:in({From, Ref}, State#state.waiting),
-            {noreply, State#state{workers = Empty, waiting = Waiting}}
-    end;
+handle_call({checkout, Block}, From, State) ->
+	NewState = handle_checkout(Block, From, State),
+	{noreply, NewState};
 
 handle_call(status, _From, State) ->
     #state{workers = Workers,
@@ -329,6 +306,10 @@ terminate(_Reason, State = #state{workers = WorkersQ, monitors = Monitors}) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+%% ===================================================================
+%% Internals
+%% ===================================================================
+
 start_pool(StartFun, PoolArgs, WorkerArgs) ->
     case proplists:get_value(name, PoolArgs) of
         undefined ->
@@ -378,14 +359,11 @@ prepopulate(N, State, Workers) ->
 handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
 		   waiting = Waiting,
-           monitors = Monitors,
            overflow = Overflow,
 		   dismiss = Dismiss} = State,
     case queue:out(Waiting) of
-        {{value, {{FromPid, _} = From, _}}, Left} ->
-            Ref = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, Ref}),
-            gen_server:reply(From, Pid),
+        {{value, {From, _}}, Left} ->
+			checkout_worker(Pid, From, State),
             State#state{waiting = Left};
         {empty, Empty} when Overflow > 0, Dismiss == true ->
             ok = dismiss_worker(Sup, Pid),
@@ -455,3 +433,74 @@ new_worker_type(#state{size = Size, max_size = MaxSize})
 		when Size < MaxSize -> static;
 new_worker_type(#state{overflow = Overflow, max_overflow = MaxOverflow})
 		when Overflow < MaxOverflow -> overflow.
+
+%% ===================================================================
+%% Handle checkout
+%% ===================================================================
+
+handle_checkout(Block, From, State0) ->
+	case get_worker(State0) of
+		{ok, Pid, State1} ->
+			checkout_worker(Pid, From, State1),
+			State1;
+		empty ->
+			handle_checkout(can_create_worker, Block, From, State0)
+	end.
+handle_checkout(can_create_worker, Block, From, State0) ->
+	case can_create_worker(State0) of
+		true -> handle_checkout(try_create_worker, Block, From, State0);
+		false when Block =:= false ->
+			gen_server:reply(From, full),
+			State0;
+		false when Block =:= true ->
+			request_to_waitings(From, State0)
+	end;
+handle_checkout(try_create_worker, Block, From, State0) ->
+	Type = new_worker_type(State0),
+	case new_worker(Type, State0) of
+		{ok, Pid} ->
+			State1 = increase_worker_counter(State0),
+			checkout_worker(Pid, From, State1),
+			State1;
+		{error, _Reason} when Block =:= false ->
+			schedule_worker_create(State0),
+			gen_server:reply(From, full),
+			State0#state{scheduled = true};
+		{error, _Reason} when Block =:= true ->
+			schedule_worker_create(State0),
+			State1 = request_to_waitings(From, State0),
+			State1#state{scheduled = true}
+	end.
+
+%% Handle checkout helpers
+
+increase_worker_counter(State = #state{size = S, max_size = MS}) when
+		S < MS ->
+	State#state{size = S + 1};
+increase_worker_counter(State = #state{overflow = O, max_overflow = MO}) when
+		O < MO ->
+	State#state{overflow = O + 1}.
+
+checkout_worker(Pid, {FromPid, _} = From, State) ->
+	Ref = erlang:monitor(process, FromPid),
+	true = ets:insert(State#state.monitors, {Pid, Ref}),
+	gen_server:reply(From, Pid).
+
+request_to_waitings({FromPid, _} = From, State) ->
+    Ref = erlang:monitor(process, FromPid),
+	Waiting = queue:in({From, Ref}, State#state.waiting),
+	State#state{waiting = Waiting}.
+
+can_create_worker(#state{scheduled = false, size = S, max_size = MS}) when
+		S < MS -> true;
+can_create_worker(#state{scheduled = false, overflow = O, max_overflow = MO}) when
+		O < MO -> true;
+can_create_worker(#state{}) -> false.
+
+get_worker(State = #state{workers = Workers}) ->
+    case queue:out(Workers) of
+        {{value, Pid}, Left} ->
+			{ok, Pid, State#state{workers = Left}};
+        {empty, _Empty} ->
+			empty
+	end.
