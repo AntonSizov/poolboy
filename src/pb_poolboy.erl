@@ -241,6 +241,8 @@ handle_info({'DOWN', Ref, _, _, _}, State) ->
             Waiting = queue:filter(fun ({_, R}) -> R =/= Ref end, State#state.waiting),
             {noreply, State#state{waiting = Waiting}}
     end;
+handle_info({'EXIT', Pid, Reason}, State = #state{supervisor = Pid}) ->
+	{stop, Reason, State};
 handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{monitors = Monitors,
 		   size = Size,
