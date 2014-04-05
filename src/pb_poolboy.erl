@@ -163,16 +163,9 @@ init([], _WorkerArgs, #state{max_size = MaxSize} = State) ->
 			scheduled = Scheduled
 	}}.
 
-handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
-    case ets:lookup(Monitors, Pid) of
-        [{Pid, Ref}] ->
-            true = erlang:demonitor(Ref),
-            true = ets:delete(Monitors, Pid),
-            NewState = handle_checkin(Pid, State),
-            {noreply, NewState};
-        [] ->
-            {noreply, State}
-    end;
+handle_cast({checkin, Pid}, State0 = #state{}) ->
+	State1 = handle_checkin(cleanup_monitors, Pid, State0),
+	{noreply, State1};
 
 handle_cast({cancel_waiting, Pid}, State) ->
     Waiting = queue:filter(fun ({{P, _}, _}) -> P =/= Pid end, State#state.waiting),
@@ -233,7 +226,7 @@ handle_info({'DOWN', Ref, _, _, _}, State) ->
     case ets:match(State#state.monitors, {'$1', Ref}) of
         [[Pid]] ->
             true = ets:delete(State#state.monitors, Pid),
-            NewState = handle_checkin(Pid, State),
+            NewState = handle_checkin(is_there_waiting, Pid, State),
             {noreply, NewState};
         [] ->
             Waiting = queue:filter(fun ({_, R}) -> R =/= Ref end, State#state.waiting),
@@ -289,22 +282,40 @@ prepopulate(N, State, Workers) ->
 		    prepopulate(N-1, State, Workers)
 	end.
 
-handle_checkin(Pid, State) ->
-    #state{supervisor = Sup,
-		   waiting = Waiting,
-           overflow = Overflow,
-		   dismiss = Dismiss} = State,
-    case queue:out(Waiting) of
-        {{value, {From, _}}, Left} ->
-			delegate_worker(Pid, From, State),
-            State#state{waiting = Left};
-        {empty, Empty} when Overflow > 0, Dismiss == true ->
-            ok = dismiss_worker(Sup, Pid),
-            State#state{waiting = Empty, overflow = Overflow - 1};
-        {empty, Empty} ->
-            Workers = queue:in(Pid, State#state.workers),
-            State#state{workers = Workers, waiting = Empty}
-    end.
+%% ===================================================================
+%% Handle checkin
+%% ===================================================================
+
+handle_checkin(cleanup_monitors, Pid, State0) ->
+	Monitors = State0#state.monitors,
+    case ets:lookup(Monitors, Pid) of
+        [{Pid, Ref}] ->
+            true = erlang:demonitor(Ref),
+            true = ets:delete(Monitors, Pid),
+            handle_checkin(is_there_waiting, Pid, State0);
+        [] ->
+			%% this case can be result of handle_worker_exit before
+			%% checkin
+            State0
+    end;
+handle_checkin(is_there_waiting, Pid, State0) ->
+	case queue:is_empty(State0#state.waiting) of
+		false ->
+			{ok, From, State1} = get_waiting(State0),
+			delegate_worker(Pid, From, State1),
+			State1;
+		true ->
+			handle_checkin(dismiss, Pid, State0)
+	end;
+handle_checkin(dismiss, Pid, State0) ->
+	case (State0#state.dismiss andalso State0#state.overflow > 0) of
+		true ->
+            ok = dismiss_worker(State0#state.supervisor, Pid),
+			decrement_worker_counter(State0);
+		false ->
+            Workers = queue:in(Pid, State0#state.workers),
+            State0#state{workers = Workers}
+	end.
 
 %% ===================================================================
 %% Handle checkout
