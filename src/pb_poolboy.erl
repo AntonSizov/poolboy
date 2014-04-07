@@ -149,16 +149,15 @@ init([{dismiss_overflow, Dismiss} | Rest], WorkerArgs, State) when is_boolean(Di
 	init(Rest, WorkerArgs, State#state{dismiss = Dismiss});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
-init([], _WorkerArgs, #state{max_size = MaxSize} = State) ->
-    Workers = prepopulate(MaxSize, State),
-	Size = queue:len(Workers),
+init([], _WorkerArgs, #state{max_size = MaxSize} = State0) ->
+    {ok, Workers, State1} = prepopulate(MaxSize, State0),
+	Size = State1#state.size,
 	Scheduled =
 	case Size < MaxSize of
-		true -> schedule_worker_create(State), true;
+		true -> schedule_worker_create(State1), true;
 		false -> false
 	end,
-    {ok, State#state{
-			size = Size,
+    {ok, State1#state{
 			workers = Workers,
 			scheduled = Scheduled
 	}}.
@@ -267,19 +266,19 @@ dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
     supervisor:terminate_child(Sup, Pid).
 
-prepopulate(N, _State) when N < 1 ->
-    queue:new();
+prepopulate(N, State) when N < 1 ->
+    {ok, queue:new(), State};
 prepopulate(N, State) ->
     prepopulate(N, State, queue:new()).
 
-prepopulate(N, _State, Workers) when N < 1 ->
-    Workers;
-prepopulate(N, State, Workers) ->
-	case new_worker(static, State) of
-		{ok, NewWorker} ->
-		    prepopulate(N-1, State, queue:in(NewWorker, Workers));
+prepopulate(N, State, Workers) when N < 1 ->
+    {ok, Workers, State};
+prepopulate(N, State0, Workers) ->
+	case new_worker(State0) of
+		{ok, NewWorker, State1} ->
+		    prepopulate(N-1, State1, queue:in(NewWorker, Workers));
 		{error, _Reason} ->
-		    prepopulate(N-1, State, Workers)
+		    prepopulate(N-1, State0, Workers)
 	end.
 
 %% ===================================================================
@@ -339,10 +338,8 @@ handle_checkout(can_create_worker, Block, From, State0) ->
 			request_to_waitings(From, State0)
 	end;
 handle_checkout(try_create_worker, Block, From, State0) ->
-	Type = new_worker_type(State0),
-	case new_worker(Type, State0) of
-		{ok, Pid} ->
-			State1 = increment_worker_counter(State0),
+	case new_worker(State0) of
+		{ok, Pid, State1} ->
 			delegate_worker(Pid, From, State1),
 			State1;
 		{error, _Reason} when Block =:= false ->
@@ -388,10 +385,8 @@ handle_unlock_create_workers(can_create_worker, State0) ->
 		false -> State0
 	end;
 handle_unlock_create_workers(try_create_worker, State0) ->
-	Type = new_worker_type(State0),
-	case new_worker(Type, State0) of
-		{ok, Pid} ->
-			State1 = increment_worker_counter(State0),
+	case new_worker(State0) of
+		{ok, Pid, State1} ->
 			{ok, From, State2} = get_waiting(State1),
 			delegate_worker(Pid, From, State2),
 			State2;
@@ -447,10 +442,8 @@ handle_worker_exit(can_create_worker, State0) ->
 		false -> State0
 	end;
 handle_worker_exit(try_create_worker, State0) ->
-	Type = new_worker_type(State0),
-	case new_worker(Type, State0) of
-		{ok, Pid} ->
-			State1 = increment_worker_counter(State0),
+	case new_worker(State0) of
+		{ok, Pid, State1} ->
 			{ok, From, State2} = get_waiting(State1),
 			delegate_worker(Pid, From, State2),
 			State2;
@@ -478,24 +471,22 @@ new_worker_type(#state{size = Size, max_size = MaxSize})
 new_worker_type(#state{overflow = Overflow, max_overflow = MaxOverflow})
 		when Overflow < MaxOverflow -> overflow.
 
-%% if auto dismiss overflow workers is disabled, notify workers
-%% that it started as overflow
-new_worker(overflow, #state{supervisor = Sup, dismiss = false}) ->
-    case supervisor:start_child(Sup, [overflow]) of
+new_worker(State0 = #state{supervisor = Sup}) ->
+	Type = new_worker_type(State0),
+	Args = new_worker_args(Type, State0),
+    case supervisor:start_child(Sup, Args) of
 		{ok, Pid} ->
+			State1 = increment_worker_counter(State0),
 		    true = link(Pid),
-			{ok, Pid};
-		{error, Reason} ->
-			{error, Reason}
-	end;
-new_worker(_, #state{supervisor = Sup}) ->
-    case supervisor:start_child(Sup, []) of
-		{ok, Pid} ->
-		    true = link(Pid),
-			{ok, Pid};
+			{ok, Pid, State1};
 		{error, Reason} ->
 			{error, Reason}
 	end.
+
+%% if auto dismiss overflow workers is disabled, notify workers
+%% that it started as overflow
+new_worker_args(overflow, #state{dismiss = false}) -> [overflow];
+new_worker_args(_Type, #state{}) -> [].
 
 increment_worker_counter(State = #state{size = S, max_size = MS}) when
 		S < MS ->
