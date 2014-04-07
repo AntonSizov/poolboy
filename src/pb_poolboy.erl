@@ -13,7 +13,9 @@
 	start/1, start/2,
 	start_link/1, start_link/2,
 	stop/1,
-	status/1
+	status/1,
+	update_size/2,
+	update_overflow/2
 ]).
 
 % gen_server callbacks
@@ -128,6 +130,14 @@ stop(Pool) ->
 status(Pool) ->
     gen_server:call(Pool, status).
 
+-spec update_size(Pool :: node(), Size :: non_neg_integer()) -> ok.
+update_size(Pool, Size) ->
+	gen_server:cast(Pool, {update_size, Size}).
+
+-spec update_overflow(Pool :: node(), Overflow :: non_neg_integer()) -> ok.
+update_overflow(Pool, Overflow) ->
+	gen_server:cast(Pool, {update_overflow, Overflow}).
+
 %% ===================================================================
 %% gen_server callbacks
 %% ===================================================================
@@ -158,6 +168,11 @@ init([], _WorkerArgs, #state{max_size = MaxSize} = State0) ->
 		false -> State2
 	end,
     {ok, State3}.
+
+handle_cast({update_size, NewMaxSize}, State = #state{}) ->
+	{noreply, State#state{max_size = NewMaxSize}};
+handle_cast({update_overflow, NewMaxOverflow},  State = #state{}) ->
+	{noreply, State#state{max_overflow = NewMaxOverflow}};
 
 handle_cast({checkin, Pid}, State0 = #state{}) ->
 	State1 = handle_checkin(cleanup_monitors, Pid, State0),
