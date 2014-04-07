@@ -27,7 +27,7 @@
 ]).
 
 -define(TIMEOUT, 5000).
--record(create_worker, {}).
+-record(unlock_create_workers, {}).
 
 -record(state, {
     supervisor :: pid(),
@@ -151,16 +151,13 @@ init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{max_size = MaxSize} = State0) ->
     {ok, Workers, State1} = prepopulate(MaxSize, State0),
-	Size = State1#state.size,
-	Scheduled =
-	case Size < MaxSize of
-		true -> schedule_worker_create(State1), true;
-		false -> false
+	State2 = State1#state{workers = Workers},
+	State3 =
+	case State2#state.size < State2#state.max_size of
+		true -> lock_worker_create(State2);
+		false -> State2
 	end,
-    {ok, State1#state{
-			workers = Workers,
-			scheduled = Scheduled
-	}}.
+    {ok, State3}.
 
 handle_cast({checkin, Pid}, State0 = #state{}) ->
 	State1 = handle_checkin(cleanup_monitors, Pid, State0),
@@ -217,9 +214,10 @@ handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
     {reply, Reply, State}.
 
-handle_info(#create_worker{}, State0 = #state{}) ->
-	State1 = handle_unlock_create_workers(State0),
-	{noreply, State1};
+handle_info(#unlock_create_workers{}, State0 = #state{}) ->
+	State1 = State0#state{scheduled = false},
+	State2 = handle_unlock_create_workers(is_there_waiting, State1),
+	{noreply, State2};
 
 handle_info({'DOWN', Ref, _, _, _}, State) ->
     case ets:match(State#state.monitors, {'$1', Ref}) of
@@ -343,13 +341,11 @@ handle_checkout(try_create_worker, Block, From, State0) ->
 			delegate_worker(Pid, From, State1),
 			State1;
 		{error, _Reason} when Block =:= false ->
-			schedule_worker_create(State0),
 			gen_server:reply(From, full),
-			State0#state{scheduled = true};
+			lock_worker_create(State0);
 		{error, _Reason} when Block =:= true ->
-			schedule_worker_create(State0),
-			State1 = request_to_waitings(From, State0),
-			State1#state{scheduled = true}
+			State1 = lock_worker_create(State0),
+			request_to_waitings(From, State1)
 	end.
 
 %% Handle checkout helpers
@@ -368,11 +364,8 @@ get_worker(State = #state{workers = Workers}) ->
 	end.
 
 %% ===================================================================
-%% Handle create worker
+%% Handle unlock create worker
 %% ===================================================================
-
-handle_unlock_create_workers(State0) ->
-	handle_unlock_create_workers(is_there_waiting, State0#state{scheduled = false}).
 
 handle_unlock_create_workers(is_there_waiting, State0) ->
 	case queue:is_empty(State0#state.waiting) of
@@ -391,15 +384,7 @@ handle_unlock_create_workers(try_create_worker, State0) ->
 			delegate_worker(Pid, From, State2),
 			State2;
 		{error, _Reason} ->
-			schedule_worker_create(State0),
-			State0#state{scheduled = true}
-	end.
-
-get_waiting(State = #state{waiting = Waiting}) ->
-	case queue:out(Waiting) of
-		{{value, {From, _}}, Left} ->
-			{ok, From, State#state{waiting = Left}};
-		{empty, _Empty} -> empty
+			lock_worker_create(State0)
 	end.
 
 %% ===================================================================
@@ -448,8 +433,7 @@ handle_worker_exit(try_create_worker, State0) ->
 			delegate_worker(Pid, From, State2),
 			State2;
 		{error, _Reason} ->
-			schedule_worker_create(State0),
-			State0#state{scheduled = true}
+			lock_worker_create(State0)
 	end.
 
 %% ===================================================================
@@ -462,9 +446,10 @@ can_create_worker(#state{scheduled = false, overflow = O, max_overflow = MO}) wh
 		O < MO -> true;
 can_create_worker(#state{}) -> false.
 
-schedule_worker_create(#state{scheduled = true}) -> ok;
-schedule_worker_create(#state{scheduled = false}) ->
-	erlang:send_after(1000, self(), #create_worker{}).
+lock_worker_create(State = #state{scheduled = false}) ->
+	erlang:send_after(1000, self(), #unlock_create_workers{}),
+	State#state{scheduled = true};
+lock_worker_create(State = #state{scheduled = true}) -> State.
 
 new_worker_type(#state{size = Size, max_size = MaxSize})
 		when Size < MaxSize -> static;
@@ -505,3 +490,10 @@ delegate_worker(Pid, {FromPid, _} = From, State) ->
 	Ref = erlang:monitor(process, FromPid),
 	true = ets:insert(State#state.monitors, {Pid, Ref}),
 	gen_server:reply(From, Pid).
+
+get_waiting(State = #state{waiting = Waiting}) ->
+	case queue:out(Waiting) of
+		{{value, {From, _}}, Left} ->
+			{ok, From, State#state{waiting = Left}};
+		{empty, _Empty} -> empty
+	end.
