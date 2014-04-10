@@ -415,7 +415,7 @@ handle_worker_exit(cleanup_monitors, Pid, State0) ->
 			State1 = decrement_worker_counter(State0),
 			handle_worker_exit(is_there_waiting, State1);
 		[] ->
-			handle_worker_exit(cleanup_ready_queue, State0)
+			handle_worker_exit(cleanup_ready_queue, Pid, State0)
 	end;
 handle_worker_exit(cleanup_ready_queue, Pid, State0) ->
 	case queue:member(Pid, State0#state.workers) of
